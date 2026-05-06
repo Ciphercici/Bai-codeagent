@@ -2,6 +2,384 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { resolveAuditSkills } from "../config/auditSkills.js";
 
+// 精确规则模式：每个规则包含多个必须同时满足的条件 + 排除逻辑
+const PRECISE_RULES = {
+  // 访问控制规则
+  "access-control": [
+    {
+      id: "ac-obj-1",
+      name: "对象级访问控制缺失",
+      severity: "high",
+      minConfidence: 0.75,
+      requireA: /\brequest\s*\.\s*(params|query|body)\s*\.\s*[a-zA-Z_][a-zA-Z0-9_]*/,
+      requireB: /\b(where|find|findOne|findById|getOne|filter)\s*\(/,
+      exclude: /\b(authorize|can|permission|policy|guard|checkOwnership|verifyOwner|tenant|isOwner)\s*\(/i,
+      pathFilter: /(controller|route|handler|service|api|resolver)/i,
+      evidence: "客户端可控对象标识直接用于数据库查询，未发现权限校验逻辑"
+    },
+    {
+      id: "ac-obj-2",
+      name: "用户ID直接用于数据查询",
+      severity: "high",
+      minConfidence: 0.8,
+      requireA: /\b(userId|user_id|uid|authorId|author_id)\s*[=.]/,
+      requireB: /\b(where|find|findOne|select|query)\s*\(/,
+      exclude: /\b(authorize|can|permission|policy)\s*\(/i,
+      pathFilter: /(model|schema|controller|service)/i,
+      evidence: "userId 直接作为查询条件，缺少权限校验"
+    },
+    {
+      id: "ac-role-1",
+      name: "公共角色权限过宽",
+      severity: "critical",
+      minConfidence: 0.85,
+      requireA: /\b(public|anonymous|guest|visitor)\s*[:=]/i,
+      requireB: /\b(create|update|delete|write|admin|manage|upload|execute)\b/i,
+      exclude: /\bread\s*[-=]|\breadonly\b/i,
+      pathFilter: /(permission|role|acl|rbac|access)/i,
+      evidence: "公共/匿名角色被授予写入或管理权限"
+    },
+    {
+      id: "ac-route-1",
+      name: "管理路由显式关闭认证",
+      severity: "critical",
+      minConfidence: 0.9,
+      requireA: /auth\s*[:\s]*false|skipAuth|bypassAuth|isPublic\s*[:\s]*true/i,
+      requireB: /(admin|manage|setting|plugin|system|user|role)/i,
+      pathFilter: /(route|router|app\.use|controller)/i,
+      evidence: "管理相关路由显式关闭认证"
+    },
+    {
+      id: "ac-api-1",
+      name: "API 无认证保护",
+      severity: "high",
+      minConfidence: 0.8,
+      requireA: /\b@Public\b|@AllowAnonymous\b|@NoAuth\b/i,
+      requireB: /@Query|@Param|@Body/i,
+      pathFilter: /(controller|resolver|api)/i,
+      evidence: "API endpoint 允许匿名访问且接受用户输入"
+    }
+  ],
+
+  // 初始化配置规则
+  "bootstrap-config": [
+    {
+      id: "bc-init-1",
+      name: "首次管理员创建可重复触发",
+      severity: "critical",
+      minConfidence: 0.85,
+      requireA: /\b(bootstrap|seed|init|createFirst|registerInitial)\b.*(Admin|User)/i,
+      requireB: /if\s*\([^)]*(!|count|exists|length)/,
+      exclude: /process\.env\.NODE_ENV\s*===\s*['"]production['"]|RUN_ONCE/,
+      pathFilter: /(seed|migration|init|setup|bootstrap)/i,
+      evidence: "管理员初始化逻辑缺少生产环境强制校验或一次性执行保护"
+    },
+    {
+      id: "bc-dev-1",
+      name: "开发模式硬编码启用",
+      severity: "high",
+      minConfidence: 0.85,
+      requireA: /\b(DEBUG|DEBUG_MODE|DEV_MODE|DEVELOPMENT)\s*[:=]\s*true/i,
+      requireB: /./,
+      exclude: /process\.env/i,
+      pathFilter: /(config|env|setting)/i,
+      evidence: "开发调试模式在代码中硬编码为 true"
+    },
+    {
+      id: "bc-pass-1",
+      name: "默认弱密码",
+      severity: "critical",
+      minConfidence: 0.95,
+      requireA: /\b(password|passwd)\s*[:=]\s*['"](?!.*\$\{)[a-zA-Z0-9!@#$%^&*]{0,12}['"]/i,
+      requireB: /^(?!.*\$\{).*(admin|root|test|demo|default|123456|password|changeme)/i,
+      exclude: /process\.env|generatePassword|hashPassword/,
+      pathFilter: /(config|seed|init)/i,
+      evidence: "配置中存在默认弱密码"
+    }
+  ],
+
+  // 上传存储规则
+  "upload-storage": [
+    {
+      id: "us-path-1",
+      name: "文件路径存在遍历风险",
+      severity: "critical",
+      minConfidence: 0.85,
+      requireA: /\b(upload|move|rename|copy)\s*\(.*[\+\.]\s*req\.|params\.|body\./i,
+      requireB: /path|fileName|name/,
+      exclude: /\b(path\.join|path\.resolve|normalize|sanitize)\b/,
+      pathFilter: /(upload|middleware|controller|service)/i,
+      evidence: "文件操作中直接使用用户输入的路径"
+    },
+    {
+      id: "us-type-1",
+      name: "文件类型校验缺失",
+      severity: "high",
+      minConfidence: 0.8,
+      requireA: /\b(upload|multer|formidable|busboy)\b/i,
+      requireB: /file|mime|type|ext\s*\(/i,
+      exclude: /\b(mimeType|fileType|checkType|validateType|allowedTypes|whitelist)\b/i,
+      pathFilter: /(upload|middleware|config)/i,
+      evidence: "上传处理未发现严格的文件类型校验"
+    },
+    {
+      id: "us-ext-1",
+      name: "允许危险文件扩展名",
+      severity: "high",
+      minConfidence: 0.9,
+      requireA: /\.(exe|sh|bat|cmd|ps1|vbs|jar|asp|jsp|php|cgi)\b/i,
+      requireB: /\b(upload|move|write|save)\s*\(/i,
+      exclude: /\b(allowedExt|permitted|whiteList)\b/i,
+      pathFilter: /(upload|middleware)/i,
+      evidence: "文件上传允许危险扩展名"
+    }
+  ],
+
+  // 查询安全规则
+  "query-safety": [
+    {
+      id: "qs-sql-1",
+      name: "SQL 原始查询存在注入风险",
+      severity: "critical",
+      minConfidence: 0.85,
+      requireA: /\b(raw|query|execute|run)\s*\(\s*[`'"]/i,
+      requireB: /(\$\{|req\.|params\.|body\.|query\.)/,
+      exclude: /\b(stmt|prepared|parameterized|bind|escape|sanitize|placeholder)\b/i,
+      pathFilter: /(model|repository|dao|service)/i,
+      evidence: "原始 SQL 查询直接拼接用户输入"
+    },
+    {
+      id: "qs-sql-2",
+      name: "动态排序字段未白名单校验",
+      severity: "high",
+      minConfidence: 0.8,
+      requireA: /\b(orderBy|order|sort)\s*\(\s*req\.|params\.|body\./i,
+      requireB: /./,
+      exclude: /\b(allowed|whitelist|permit|map|switch)\b/i,
+      pathFilter: /(controller|service)/i,
+      evidence: "排序字段直接来自用户输入"
+    },
+    {
+      id: "qs-nosql-1",
+      name: "NoSQL 注入风险",
+      severity: "high",
+      minConfidence: 0.8,
+      requireA: /\bfind\([^}]*\$where|\$\s*ne\s*|\$gt\s*|\$lt\s*|\$nin\b/i,
+      requireB: /req\.|params\.|body\./,
+      exclude: /\b(sanitize|validate|escape)\b/i,
+      pathFilter: /(model|controller|service)/i,
+      evidence: "NoSQL 查询中使用用户输入的操作符"
+    }
+  ],
+
+  // 敏感信息规则
+  "secret-exposure": [
+    {
+      id: "se-env-1",
+      name: "前端暴露敏感环境变量",
+      severity: "critical",
+      minConfidence: 0.95,
+      requireA: /\b(NEXT_PUBLIC_|VITE_|PUBLIC_|REACT_APP_)[A-Z0-9_]*\b/i,
+      requireB: /\b(secret|key|token|password|auth|PRIVATE|API_KEY)\b/i,
+      exclude: /\b(URL|ENDPOINT|PUBLIC)\b/,
+      pathFilter: /\.env\.|\.env\./i,
+      evidence: "前端环境变量中包含敏感信息"
+    },
+    {
+      id: "se-hard-1",
+      name: "硬编码密钥",
+      severity: "critical",
+      minConfidence: 0.9,
+      requireA: /(apiKey|apiSecret|clientSecret|privateKey|accessToken)\s*[:=]\s*['"][a-zA-Z0-9_-]{20,}['"]/i,
+      requireB: /./,
+      exclude: /process\.env|generate|create.*Key/,
+      pathFilter: /(config|constant|setting)/i,
+      evidence: "代码中硬编码了 API 密钥"
+    },
+    {
+      id: "se-jwt-1",
+      name: "JWT 密钥弱或硬编码",
+      severity: "critical",
+      minConfidence: 0.95,
+      requireA: /\bjwt\s*\(\s*\{[^}]*secret\s*[:=]\s*['"][^'"]+['"]/i,
+      requireB: /./,
+      exclude: /process\.env|generateSecret/,
+      pathFilter: /(config|auth|middleware)/i,
+      evidence: "JWT 密钥为硬编码"
+    },
+    {
+      id: "se-aws-1",
+      name: "AWS 密钥硬编码",
+      severity: "critical",
+      minConfidence: 0.95,
+      requireA: /\b(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)\s*=\s*['"][A-Z0-9]{20,}['"]/i,
+      requireB: /./,
+      exclude: /process\.env/,
+      pathFilter: /(config|env)/i,
+      evidence: "AWS 密钥硬编码在代码中"
+    }
+  ],
+
+  // SSRF 规则
+  "ssrf": [
+    {
+      id: "sr-fetch-1",
+      name: "用户可控 URL 存在 SSRF 风险",
+      severity: "critical",
+      minConfidence: 0.85,
+      requireA: /\b(fetch|axios|request|http\.get|http\.post|got)\s*\(.*req\.|params\.|body\./i,
+      requireB: /\burl|link|href|src/,
+      exclude: /\b(validate|whitelist|allowed|isLocal|isPrivateHost|isInternal)\b/i,
+      pathFilter: /(controller|service|proxy)/i,
+      evidence: "允许用户控制 URL 进行网络请求"
+    }
+  ],
+
+  // 命令注入规则
+  "command-injection": [
+    {
+      id: "ci-exec-1",
+      name: "命令注入风险",
+      severity: "critical",
+      minConfidence: 0.9,
+      requireA: /\b(exec|spawn|execSync|system|popen|execFile)\s*\([^)]*(req\.|params\.|body\.|argv)/i,
+      requireB: /./,
+      exclude: /\b(escape|sanitize|arg|command)\b/i,
+      pathFilter: /(controller|service)/i,
+      evidence: "用户输入直接用于命令执行"
+    },
+    {
+      id: "ci-spawn-1",
+      name: "child_process 参数注入",
+      severity: "critical",
+      minConfidence: 0.9,
+      requireA: /\bspawn\([^)]*shell\s*:\s*true/i,
+      requireB: /req\.|params\.|body\./,
+      pathFilter: /(service)/i,
+      evidence: "使用 shell 执行且参数来自用户输入"
+    }
+  ],
+
+  // 路径穿越规则
+  "path-traversal": [
+    {
+      id: "pt-path-1",
+      name: "路径穿越风险",
+      severity: "critical",
+      minConfidence: 0.85,
+      requireA: /\b(readFile|readFileSync|createReadStream|open)\s*\([^)]*\+.*req\.|params\.|body\./i,
+      requireB: /path|file/,
+      exclude: /\b(path\.join|path\.resolve|normalize|baseDir|rootPath)\b/i,
+      pathFilter: /(controller|service|middleware)/i,
+      evidence: "文件读取路径中可能存在路径穿越"
+    }
+  ],
+
+  // XSS 规则
+  "xss": [
+    {
+      id: "xs-ref-1",
+      name: "反射型 XSS 风险",
+      severity: "high",
+      minConfidence: 0.8,
+      requireA: /\bres\.send\(|res\.render\(|innerHTML\s*=|outerHTML\s*=/i,
+      requireB: /req\.|params\.|body\.|query\./,
+      exclude: /\b(escape|encode|sanitize|xss|escapeHtml|textContent)\b/i,
+      pathFilter: /(controller|route|view)/i,
+      evidence: "用户输入未经过滤直接输出到页面"
+    },
+    {
+      id: "xs-vue-1",
+      name: "Vue v-html 可能存在 XSS",
+      severity: "high",
+      minConfidence: 0.85,
+      requireA: /v-html\s*=/i,
+      requireB: /req\.|params\.|body\./,
+      exclude: /\b(sanitize|DOMPurify|escape)\b/,
+      pathFilter: /\.vue|\.jsx|\.tsx/i,
+      evidence: "使用 v-html 绑定用户输入"
+    }
+  ],
+
+  // 不安全的反序列化
+  "deserialization": [
+    {
+      id: "ds-eval-1",
+      name: "Eval 不安全使用",
+      severity: "critical",
+      minConfidence: 0.95,
+      requireA: /\beval\s*\(\s*req\.|params\.|body\./i,
+      requireB: /./,
+      pathFilter: /(controller|route|service)/i,
+      evidence: "eval() 中直接使用用户输入"
+    },
+    {
+      id: "ds-parse-1",
+      name: "不安全的反序列化",
+      severity: "critical",
+      minConfidence: 0.9,
+      requireA: /\bJSON\.parse\(|yaml\.load\(|pickle\.load\(/i,
+      requireB: /req\.|params\.|body\./,
+      exclude: /\b(safe|loadSilent)\b/i,
+      pathFilter: /(controller|service|middleware)/i,
+      evidence: "反序列化用户输入的数据"
+    }
+  ]
+};
+
+// 规则匹配函数
+function matchPreciseRule(content, rule) {
+  // 检查路径过滤
+  if (rule.pathFilter && !rule.pathFilter.test(content)) {
+    return false;
+  }
+
+  // 检查 A 条件
+  if (!rule.requireA.test(content)) {
+    return false;
+  }
+
+  // 检查 B 条件
+  if (!rule.requireB.test(content)) {
+    return false;
+  }
+
+  // 排除条件
+  if (rule.exclude && rule.exclude.test(content)) {
+    return false;
+  }
+
+  return true;
+}
+
+function createFinding(finding) {
+  return {
+    source: "rule",
+    ...finding
+  };
+}
+
+function prioritizeFindings(findings) {
+  const deduped = [];
+  const seen = new Set();
+  for (const finding of findings) {
+    const key = `${finding.title}::${finding.location}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(finding);
+  }
+
+  // 严重性优先级：critical > high > medium > low
+  const severityOrder = { critical: 4, high: 3, medium: 2, low: 1 };
+  return deduped
+    .filter((finding) => finding.confidence >= 0.6)
+    .sort((a, b) => {
+      const sevDiff = (severityOrder[b.severity] || 0) - (severityOrder[a.severity] || 0);
+      if (sevDiff !== 0) return sevDiff;
+      return b.confidence - a.confidence;
+    });
+}
+
 export class AuditAnalystAgent {
   constructor({ llmReviewer }) {
     this.llmReviewer = llmReviewer;
@@ -95,187 +473,46 @@ async function buildHeuristicFindings(project, reviewProfile) {
   const findings = [];
   const enabledSkills = new Set(reviewProfile.map((skill) => skill.id));
 
+  // 收集所有文件内容用于跨文件分析
+  const fileContents = new Map();
   for (const file of files) {
     const content = await fs.readFile(file, "utf8");
     const relative = path.relative(sourceRoot, file).replaceAll("\\", "/");
+    fileContents.set(relative, content);
+  }
+
+  // 应用精确规则
+  for (const [relative, content] of fileContents) {
     const loweredPath = relative.toLowerCase();
 
-    if (
-      enabledSkills.has("access-control") &&
-      hasObjectAccessIndicator(content) &&
-      !hasAuthGuardIndicator(content) &&
-      /(controller|route|resolver|service|api)/.test(loweredPath)
-    ) {
-      findings.push(createFinding({
-        skillId: "access-control",
-        title: "对象级访问控制边界值得重点复核",
-        severity: "medium",
-        confidence: 0.76,
-        location: relative,
-        impact: "如果控制器或服务层直接信任客户端提交的对象标识，可能导致跨用户或跨租户读取、修改内容。",
-        evidence: `在 ${relative} 中发现了客户端可控对象标识的处理痕迹，但同文件附近没有明显的 ownership / policy / guard 校验线索。`,
-        remediation: "在对象查询后、返回或修改前统一执行 role、tenant 与 ownership 校验，并让服务层承担二次鉴权职责。",
-        safeValidation: "本地复核控制器到服务层的调用链，确认对象查找后的每条读写路径都执行了访问控制。"
-      }));
+    // 跳过测试文件和文档
+    if (loweredPath.includes("/test/") || loweredPath.includes("/spec/") || loweredPath.includes(".md") || loweredPath.includes("readme")) {
+      continue;
     }
 
-    if (
-      enabledSkills.has("access-control") &&
-      matches(content, /\b(public|anonymous|guest)\b/i, /\b(permission|permissions|role|roles|allow|grant|create|update|delete|read|find)\b/i) &&
-      /(permission|policy|role|acl|rbac|config)/.test(loweredPath)
-    ) {
-      findings.push(createFinding({
-        skillId: "access-control",
-        title: "公共角色权限配置可能过宽",
-        severity: "high",
-        confidence: 0.79,
-        location: relative,
-        impact: "如果匿名或公共角色被默认授予内容管理能力，后台或 API 可能暴露出超出预期的读写面。",
-        evidence: `在 ${relative} 中发现了 public / anonymous / guest 角色与权限授予语义同时出现。`,
-        remediation: "将公共角色改为 deny-by-default，只为必要的读取接口单独放行，并把管理动作留给显式认证后的角色。",
-        safeValidation: "本地检查角色初始化与权限合并逻辑，确认匿名角色不会默认获得管理或写入能力。"
-      }));
-    }
+    for (const [skillId, rules] of Object.entries(PRECISE_RULES)) {
+      if (!enabledSkills.has(skillId)) continue;
 
-    if (
-      enabledSkills.has("bootstrap-config") &&
-      matches(content, /\b(bootstrapAdmin|seedAdmin|createFirstAdmin|registerInitialAdmin|setupAdmin|initialAdmin)\b/i, /\b(process\.env|config|if\s*\(!|allowBootstrap|enableBootstrap)\b/i)
-    ) {
-      findings.push(createFinding({
-        skillId: "bootstrap-config",
-        title: "初始化管理员入口需要确认关闭条件",
-        severity: "high",
-        confidence: 0.82,
-        location: relative,
-        impact: "如果首次管理员创建逻辑缺少严格的单次条件或部署态关闭机制，生产环境可能暴露出高权限初始化入口。",
-        evidence: `在 ${relative} 中发现了管理员初始化逻辑，并与环境配置或缺省条件绑定。`,
-        remediation: "将首次管理员创建流程改为一次性、显式确认、默认关闭，并确保初始化完成后彻底失效。",
-        safeValidation: "本地审查启动与迁移流程，确认生产缺省态下不存在可重复触发的管理员初始化路径。"
-      }));
-    }
-
-    if (
-      enabledSkills.has("access-control") &&
-      (matches(content, /\b(auth\s*:\s*false|skipAuth|bypassAuth|allowUnauthenticated|publicRoute)\b/i, /\b(route|router|endpoint|admin|panel|plugin)\b/i) ||
-        (/(route|router|admin|plugin)/.test(loweredPath) && /\bauth\s*:\s*false\b/i.test(content)))
-    ) {
-      findings.push(createFinding({
-        skillId: "access-control",
-        title: "部分管理或插件路由显式关闭认证",
-        severity: "high",
-        confidence: 0.8,
-        location: relative,
-        impact: "如果这些路由位于后台、插件或管理入口附近，显式关闭认证可能直接扩大高价值接口的暴露面。",
-        evidence: `在 ${relative} 中发现了 auth:false 或类似绕过认证的配置语义。`,
-        remediation: "对后台、插件与管理路由采用显式白名单，默认启用鉴权与权限中间件，再按需对公开只读接口单独豁免。",
-        safeValidation: "本地检查路由注册代码，确认仅少量公开只读接口会关闭认证，管理与插件路由默认受保护。"
-      }));
-    }
-
-    if (
-      enabledSkills.has("upload-storage") &&
-      matches(content, /\b(upload|multer|formidable|busboy|content-type|multipart)\b/i, /\b(path\.join|fs\.writeFile|writeFileSync|createWriteStream|public\/|static\/)\b/)
-    ) {
-      findings.push(createFinding({
-        skillId: "upload-storage",
-        title: "上传与公开文件边界值得重点审查",
-        severity: "medium",
-        confidence: 0.71,
-        location: relative,
-        impact: "如果上传内容的类型、文件名或公开访问目录没有被严格隔离，可能引发任意文件覆盖、危险内容托管或后台资源泄露。",
-        evidence: `在 ${relative} 中同时出现了上传处理与文件落盘或公开目录语义。`,
-        remediation: "对文件类型、扩展名、目标路径和公开目录做统一收口，公开资源目录与后台可执行路径应彻底隔离。",
-        safeValidation: "本地复核上传链路，确认文件名、目标路径、MIME 与公开访问目录都经过规范化控制。"
-      }));
-    }
-
-    if (
-      enabledSkills.has("secret-exposure") &&
-      matches(content, /\b(password|secret|token|api[_-]?key)\b/i, /\b(default|example|changeme|admin123|test|demo|sample)\b/i)
-    ) {
-      findings.push(createFinding({
-        skillId: "secret-exposure",
-        title: "疑似存在默认凭据或占位密钥风险",
-        severity: "high",
-        confidence: 0.74,
-        location: relative,
-        impact: "如果这些默认值会进入初始化流程、后台登录或第三方集成配置，真实部署时可能留下可猜测的高风险入口。",
-        evidence: `在 ${relative} 中发现了凭据命名与默认值样式同时出现。`,
-        remediation: "移除可运行的默认凭据；缺失密钥时应 fail closed，而不是退回演示或占位值。",
-        safeValidation: "本地检查配置装载与初始化逻辑，确认占位值不会被当作真实凭据接受。"
-      }));
-    }
-
-    if (
-      enabledSkills.has("secret-exposure") &&
-      matches(content, /\b(NEXT_PUBLIC_|PUBLIC_|VITE_)\b/, /\b(secret|token|api[_-]?key|admin|password)\b/i)
-    ) {
-      findings.push(createFinding({
-        skillId: "secret-exposure",
-        title: "公开前端变量中疑似携带敏感配置",
-        severity: "medium",
-        confidence: 0.68,
-        location: relative,
-        impact: "如果敏感令牌或后台配置通过公开构建变量注入前端，可能导致管理能力或集成密钥暴露。",
-        evidence: `在 ${relative} 中发现了公开前端环境变量前缀与敏感配置命名同时出现。`,
-        remediation: "把敏感配置留在服务端，前端仅使用临时票据、代理接口或最小化公开标识。",
-        safeValidation: "本地检查构建配置与运行时注入逻辑，确认公开变量中不包含后台密钥或管理接口凭据。"
-      }));
-    }
-
-    if (
-      enabledSkills.has("query-safety") &&
-      matches(content, /\b(raw\(|sequelize\.query\(|knex\.raw\(|prisma\.[a-z]+Raw\(|SELECT\b|UPDATE\b|DELETE\b)\b/i, /(`[^`]*\$\{|\+\s*(req|params|query|body)|\b(req|params|query|body)\b)/i)
-    ) {
-      findings.push(createFinding({
-        skillId: "query-safety",
-        title: "动态查询构造路径需要重点确认",
-        severity: "medium",
-        confidence: 0.64,
-        location: relative,
-        impact: "如果这类动态查询直接拼接外部输入，内容检索、管理后台筛选或插件接口可能出现持久层注入风险。",
-        evidence: `在 ${relative} 中发现了原始查询语义，并伴随模板插值或外部输入拼接痕迹。`,
-        remediation: "优先改用参数化查询或 ORM 安全接口，并对动态排序、筛选字段做白名单约束。",
-        safeValidation: "本地确认原始查询是否始终采用参数绑定，动态字段和值是否都经过白名单控制。"
-      }));
+      for (const rule of rules) {
+        if (matchPreciseRule(content, rule)) {
+          findings.push(createFinding({
+            skillId,
+            title: rule.name,
+            severity: rule.severity,
+            confidence: rule.minConfidence,
+            location: relative,
+            evidence: rule.evidence,
+            impact: `该代码存在 ${rule.name} 风险，需要重点人工复核。`,
+            remediation: `建议添加 ${rule.name} 的安全防护措施。`,
+            safeValidation: "建议在本地代码审查中验证此问题是否真实存在。"
+          }));
+        }
+      }
     }
   }
 
-  return prioritizeFindings(findings).slice(0, 8);
-}
-
-function createFinding(finding) {
-  return {
-    source: "rule",
-    ...finding
-  };
-}
-
-function prioritizeFindings(findings) {
-  const deduped = [];
-  const seen = new Set();
-  for (const finding of findings) {
-    const key = `${finding.title}::${finding.location}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(finding);
-  }
-
-  return deduped
-    .filter((finding) => finding.confidence >= 0.6)
-    .sort((a, b) => severityScore(b.severity) - severityScore(a.severity) || b.confidence - a.confidence);
-}
-
-function hasObjectAccessIndicator(content) {
-  return /(req|request)\.(params|query)\.[a-zA-Z0-9_]+/.test(content) || /\b(ctx|event)\.(params|query)\.[a-zA-Z0-9_]+/.test(content);
-}
-
-function hasAuthGuardIndicator(content) {
-  return /\b(can|authorize|authorization|permission|permissions|policy|guard|rbac|ownership|tenant)\b/i.test(content);
-}
-
-function severityScore(value) {
-  return value === "high" ? 3 : value === "medium" ? 2 : 1;
+  // 按置信度排序并限制结果数
+  return prioritizeFindings(findings).slice(0, 15);
 }
 
 async function collectFiles(root) {
@@ -291,8 +528,4 @@ async function collectFiles(root) {
   } catch {
     return [];
   }
-}
-
-function matches(content, requiredA, requiredB) {
-  return requiredA.test(content) && requiredB.test(content);
 }
