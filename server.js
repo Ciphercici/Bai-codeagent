@@ -5,11 +5,13 @@ import { fileURLToPath } from "node:url";
 import { FrameworkScoutAgent } from "./src/agents/frameworkScoutAgent.js";
 import { LocalRepoScoutAgent } from "./src/agents/localRepoScoutAgent.js";
 import { AuditAnalystAgent } from "./src/agents/auditAnalystAgent.js";
+import { FofaScoutAgent } from "./src/agents/fofaScoutAgent.js";
 import { getAuditSkillCatalog } from "./src/config/auditSkills.js";
 import { getProviderPreset, maskSecret, resolveLlmConfig } from "./src/config/llmProviders.js";
 import { buildEnvironmentReport } from "./src/services/environmentReport.js";
 import { DefensiveLlmReviewer } from "./src/services/llmReviewService.js";
 import { createMemoryStore } from "./src/services/memoryStore.js";
+import { createFingerprintService } from "./src/services/fingerprintService.js";
 import { writeAuditHtmlReport } from "./src/services/reportWriter.js";
 import { createSettingsStore } from "./src/services/settingsStore.js";
 import { createTaskStore } from "./src/store/taskStore.js";
@@ -27,11 +29,15 @@ const scoutAgent = new FrameworkScoutAgent({
   downloadsDir,
   getGithubConfig: async () => (await settingsStore.read()).github
 });
+const fofaScoutAgent = new FofaScoutAgent({
+  getFofaConfig: async () => (await settingsStore.read()).fofa
+});
 const localScoutAgent = new LocalRepoScoutAgent({ downloadsDir });
 const llmReviewer = new DefensiveLlmReviewer();
 const auditAgent = new AuditAnalystAgent({ llmReviewer });
 const tasks = createTaskStore();
 const memoryStore = createMemoryStore({ filePath: memoryFile });
+const fingerprintService = createFingerprintService({ downloadsDir });
 
 await fs.mkdir(downloadsDir, { recursive: true });
 await fs.mkdir(reportsDir, { recursive: true });
@@ -74,6 +80,11 @@ const server = http.createServer(async (req, res) => {
           token: body?.github?.token ? body.github.token : current.github.token,
           ownerFilter: body?.github?.ownerFilter ?? current.github.ownerFilter,
           notes: body?.github?.notes ?? current.github.notes
+        },
+        fofa: {
+          email: body?.fofa?.email ?? current.fofa.email,
+          apiKey: body?.fofa?.apiKey ? body.fofa.apiKey : current.fofa.apiKey,
+          notes: body?.fofa?.notes ?? current.fofa.notes
         }
       });
       return sendJson(res, 200, sanitizeSettings(updated));
@@ -90,6 +101,33 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/memory") {
       return sendJson(res, 200, await memoryStore.read());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/fingerprint/projects") {
+      return sendJson(res, 200, await fingerprintService.listProjects());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/fingerprint/analyze") {
+      const body = await readJson(req);
+      return sendJson(res, 200, await fingerprintService.analyzeProject(String(body?.projectId || "")));
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/fingerprint/match") {
+      const body = await readJson(req);
+      return sendJson(res, 200, await fingerprintService.matchAssets({
+        projectId: String(body?.projectId || ""),
+        assetText: String(body?.assetText || "")
+      }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/fofa/quick") {
+      const settings = await settingsStore.read();
+      if (!settings.fofa.apiKey) {
+        return sendJson(res, 400, { error: "未配置 FOFA API Key" });
+      }
+      const query = url.searchParams.get("q") || "";
+      const result = await fofaScoutAgent.run({ query, size: 10 });
+      return sendJson(res, 200, result);
     }
 
     if (req.method === "POST" && url.pathname === "/api/memory") {
@@ -125,6 +163,22 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/tasks") {
       return sendJson(res, 200, tasks.listTasks());
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/tasks/cancel") {
+      const body = await readJson(req);
+      const taskId = body?.taskId;
+      const task = tasks.getTask(taskId);
+      if (!task) {
+        return sendJson(res, 404, { error: "Task not found" });
+      }
+      tasks.updateTask(taskId, { status: "cancelled", phase: "cancelled", message: "Task cancelled by user." });
+      return sendJson(res, 200, tasks.getTask(taskId));
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/api/tasks/") && url.pathname.endsWith("/stream")) {
+      const id = url.pathname.split("/")[3];
+      return serveSse(res, id, tasks);
     }
 
     if (req.method === "GET" && url.pathname.startsWith("/api/tasks/")) {
@@ -172,7 +226,12 @@ async function runScout(taskId) {
   const task = tasks.getTask(taskId);
   const scoutResult = task.sourceType === "local"
     ? await localScoutAgent.run({ localRepoPaths: task.localRepoPaths })
-    : await scoutAgent.run({ query: task.query });
+    : await scoutAgent.run({
+      query: task.query,
+      cmsType: task.cmsType,
+      industry: task.industry,
+      minAdoption: task.minAdoption
+    });
   tasks.updateTask(taskId, {
     status: "awaiting_selection",
     phase: "target-selection",
@@ -366,6 +425,13 @@ function sanitizeSettings(settings) {
       ownerFilter: settings.github.ownerFilter,
       notes: settings.github.notes
     },
+    fofa: {
+      email: settings.fofa.email,
+      apiKeyConfigured: Boolean(settings.fofa.apiKey),
+      apiKeyMasked: maskSecret(settings.fofa.apiKey),
+      notes: settings.fofa.notes,
+      safeMode: "stored-only"
+    },
     updatedAt: settings.updatedAt
   };
 }
@@ -377,8 +443,14 @@ function providerDefaults(providerId) {
 
 async function testConnections(settings) {
   const llm = resolveLlmConfig(process.env, settings.llm);
-  const [llmTest, githubTest] = await Promise.all([testLlmConnection(llm), testGithubConnection(settings.github)]);
-  return { testedAt: new Date().toISOString(), llm: llmTest, github: githubTest, overall: llmTest.ok && githubTest.ok ? "pass" : llmTest.ok || githubTest.ok ? "partial" : "warn" };
+  const [llmTest, githubTest, fofaTest] = await Promise.all([
+    testLlmConnection(llm),
+    testGithubConnection(settings.github),
+    testFofaConnection(settings.fofa)
+  ]);
+  const allOk = llmTest.ok && githubTest.ok && fofaTest.ok;
+  const someOk = llmTest.ok || githubTest.ok || fofaTest.ok;
+  return { testedAt: new Date().toISOString(), llm: llmTest, github: githubTest, fofa: fofaTest, overall: allOk ? "pass" : someOk ? "partial" : "warn" };
 }
 
 async function testGithubConnection(github) {
@@ -410,6 +482,27 @@ async function testGithubConnection(github) {
     }
 
     return { ok: false, status: "warn", message: `GitHub 返回 ${response.status}` };
+  } catch (error) {
+    return { ok: false, status: "warn", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function testFofaConnection(fofa) {
+  if (!fofa.apiKey) return { ok: false, status: "warn", message: "未配置 FOFA API Key" };
+  if (!fofa.email) return { ok: false, status: "warn", message: "未配置 FOFA Email" };
+  try {
+    const encoded = btoa(`${fofa.email}:${fofa.apiKey}`);
+    const response = await fetch("https://api.fofa.com/v1/search/all?size=1&qbase64=IiI=", {
+      headers: {
+        Authorization: `Basic ${encoded}`,
+        Accept: "application/json"
+      }
+    });
+
+    if (response.ok) {
+      return { ok: true, status: "pass", message: "FOFA API 可用" };
+    }
+    return { ok: false, status: "warn", message: `FOFA 返回 ${response.status}` };
   } catch (error) {
     return { ok: false, status: "warn", message: error instanceof Error ? error.message : String(error) };
   }
@@ -452,39 +545,45 @@ function applyMemoryDefaults(body, memory) {
         .map((item) => item.trim())
         .filter(Boolean);
 
-  if (sourceType === "local") {
-    return {
-      ...body,
-      sourceType,
-      selectedSkillIds,
-      localRepoPaths,
-      useMemory,
-      query: "local repository import",
-      minAdoption: 0
-    };
-  }
+    if (sourceType === "local") {
+      return {
+        ...body,
+        sourceType,
+        selectedSkillIds,
+        localRepoPaths,
+        useMemory,
+        query: "local repository import",
+        cmsType: "all",
+        industry: "all",
+        minAdoption: 0
+      };
+    }
 
   if (!useMemory) {
     return {
       ...body,
       sourceType,
-      selectedSkillIds,
-      localRepoPaths: [],
-      useMemory: false,
-      query: body.query || 'topic:cms OR "headless cms" OR "content management system"',
-      minAdoption: Number(body.minAdoption || 100)
-    };
-  }
+        selectedSkillIds,
+        localRepoPaths: [],
+        useMemory: false,
+        query: body.query || 'topic:cms OR "headless cms" OR "content management system"',
+        cmsType: body.cmsType || "all",
+        industry: body.industry || "all",
+        minAdoption: Number(body.minAdoption || 100)
+      };
+    }
   return {
     ...body,
     sourceType,
-    selectedSkillIds,
-    localRepoPaths: [],
-    useMemory,
-    query: body.query || memory.preferences.preferredQuery,
-    minAdoption: Number(body.minAdoption || memory.preferences.preferredMinAdoption || 100)
-  };
-}
+      selectedSkillIds,
+      localRepoPaths: [],
+      useMemory,
+      query: body.query || memory.preferences.preferredQuery,
+      cmsType: body.cmsType || "all",
+      industry: body.industry || "all",
+      minAdoption: Number(body.minAdoption || memory.preferences.preferredMinAdoption || 100)
+    };
+  }
 
 function buildMemorySnapshot(memory) {
   return { rules: memory.rules, preferences: memory.preferences, learnedPatterns: memory.learnedPatterns.slice(0, 5) };
@@ -536,6 +635,23 @@ function sendJson(res, statusCode, payload) {
     Expires: "0"
   });
   res.end(JSON.stringify(payload, null, 2));
+}
+
+function serveSse(res, taskId, taskStore) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-store, max-age=0",
+    "Connection": "keep-alive"
+  });
+
+  const unsubscribe = taskStore.subscribe(taskId, (event) => {
+    res.write(`event: ${event.event}\n`);
+    res.write(`data: ${JSON.stringify(event.task)}\n\n`);
+  });
+
+  res.on("close", () => {
+    unsubscribe();
+  });
 }
 
 const port = process.env.PORT || 3000;
